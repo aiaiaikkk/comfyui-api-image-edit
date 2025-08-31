@@ -1,0 +1,112 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comfyui-api-image-edit"
+version = "1.0.0"
+description = "A powerful ComfyUI custom node for API-based image editing with multiple provider support"
+readme = "README.md"
+license = {text = "MIT License"}
+authors = [
+    {name = "aiaiaikkk"},
+]
+maintainers = [
+    {name = "aiaiaikkk"},
+]
+keywords = [
+    "comfyui",
+    "image-editing", 
+    "ai",
+    "api",
+    "custom-node",
+    "multi-provider",
+    "modelscope",
+    "openai",
+    "gemini",
+    "pixelwords"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "requests>=2.25.1",
+    "Pillow>=8.0.0",
+    "numpy>=1.19.0",
+    "torch>=1.9.0",
+    "google-generativeai>=0.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov>=2.0",
+    "black>=21.0",
+    "flake8>=3.8",
+    "mypy>=0.800",
+]
+
+[project.urls]
+Homepage = "https://github.com/aiaiaikkk/comfyui-api-image-edit"
+Repository = "https://github.com/aiaiaikkk/comfyui-api-image-edit"
+Documentation = "https://github.com/aiaiaikkk/comfyui-api-image-edit#readme"
+"Bug Reports" = "https://github.com/aiaiaikkk/comfyui-api-image-edit/issues"
+"Source Code" = "https://github.com/aiaiaikkk/comfyui-api-image-edit"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["*"]
+exclude = ["tests*", "docs*", "examples*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.js", "*.md", "*.txt", "*.yaml", "*.yml"]
+
+[tool.comfy]
+PublisherId = "aiaiaikkk"
+DisplayName = "ComfyUI API Image Edit"
+Icon = ""
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.mypy_cache
+  | \.pytest_cache
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+addopts = "-v --tb=short --strict-markers"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+]
