@@ -11,6 +11,7 @@ import requests
 import time
 import os
 import tempfile
+import uuid
 from typing import Dict, List, Optional, Tuple, Any
 from PIL import Image
 import numpy as np
@@ -91,6 +92,27 @@ class APIImageEditNode:
         return provider_models.get(provider, ["No models available"])
     
     @classmethod
+    def is_image_generation_model(cls, provider, model):
+        """检查模型是否支持图像生成"""
+        image_gen_keywords = [
+            'image-generation', 'image-preview', 'dall-e', 'stable-diffusion',
+            'flux', 'ideogram', 'seededit', 'mj-chat'
+        ]
+        
+        # Gemini特殊处理
+        if provider == "Google Gemini":
+            gemini_image_models = [
+                "gemini-2.5-flash-image-preview",
+                "gemini-2.0-flash-preview-image-generation", 
+                "gemini-2.0-flash-exp-image-generation"
+            ]
+            return model in gemini_image_models
+        
+        # 其他提供商的图像生成模型检测
+        model_lower = model.lower()
+        return any(keyword in model_lower for keyword in image_gen_keywords)
+    
+    @classmethod
     def update_model_list_for_provider(cls, provider):
         """为指定提供商更新模型列表 - ComfyUI前端可调用此方法"""
         models = cls.get_models_for_provider(provider)
@@ -121,6 +143,70 @@ class APIImageEditNode:
                 filtered_models.append(model)
                 
         return filtered_models if filtered_models else all_models
+    
+    def get_or_create_session_id(self):
+        """获取或创建会话ID"""
+        import uuid
+        import time
+        
+        if not self.session_id:
+            self.session_id = f"session_{int(time.time())}_{str(uuid.uuid4())[:8]}"
+        return self.session_id
+    
+    def reset_conversation(self):
+        """重置对话会话"""
+        if self.session_id:
+            if self.session_id in self.conversation_sessions:
+                del self.conversation_sessions[self.session_id]
+            if self.session_id in self.conversation_history:
+                del self.conversation_history[self.session_id]
+        self.session_id = None
+        print("[APIImageEdit] 对话会话已重置")
+    
+    def get_conversation_history(self, session_id):
+        """获取对话历史"""
+        if session_id not in self.conversation_history:
+            self.conversation_history[session_id] = {
+                'messages': [],
+                'images': [],  # 存储每轮的图像
+                'created_at': time.time()
+            }
+        return self.conversation_history[session_id]
+    
+    def add_to_conversation_history(self, session_id, user_message, model_response, image_b64=None):
+        """添加到对话历史"""
+        history = self.get_conversation_history(session_id)
+        
+        # 添加用户消息
+        history['messages'].append({
+            'role': 'user',
+            'content': user_message,
+            'timestamp': time.time()
+        })
+        
+        # 添加模型响应
+        history['messages'].append({
+            'role': 'model', 
+            'content': model_response,
+            'timestamp': time.time()
+        })
+        
+        # 添加生成的图像
+        if image_b64:
+            history['images'].append({
+                'image_b64': image_b64,
+                'prompt': user_message,
+                'timestamp': time.time()
+            })
+        
+        # 限制历史长度，避免内存溢出
+        max_messages = 20
+        if len(history['messages']) > max_messages:
+            history['messages'] = history['messages'][-max_messages:]
+        
+        max_images = 10
+        if len(history['images']) > max_images:
+            history['images'] = history['images'][-max_images:]
     
     @classmethod
     def INPUT_TYPES(cls):
@@ -154,17 +240,23 @@ class APIImageEditNode:
                 "image2": ("IMAGE",),
                 "image3": ("IMAGE",),
                 "image4": ("IMAGE",),
-                "mask": ("MASK",),
-                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
-                "guidance_scale": ("FLOAT", {"default": 7.5, "min": 1.0, "max": 20.0, "step": 0.1}),
-                "steps": ("INT", {"default": 20, "min": 1, "max": 100}),
-                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
                 "watermark": ("BOOLEAN", {"default": False}),
-                "negative_prompt": ("STRING", {"default": "", "multiline": True}),
+                # 生成模式选择
+                "generation_mode": (["single", "multiple", "chat", "edit_history"], {"default": "single"}),
+                "image_count": ("INT", {"default": 1, "min": 1, "max": 16}),
+                # 多轮对话控制
+                "conversation_mode": ("BOOLEAN", {"default": True}),
+                "reset_conversation": ("BOOLEAN", {"default": False}),
+                "use_last_image": ("BOOLEAN", {"default": False}),
             }
         }
     
     def __init__(self):
+        # 多轮对话支持
+        self.conversation_sessions = {}  # 存储每个节点的对话会话
+        self.conversation_history = {}   # 存储对话历史和图像
+        self.session_id = None          # 当前会话ID
+        
         self.api_configs = {
             "ModelScope": {
                 "provider_key": "modelscope",
@@ -252,8 +344,7 @@ class APIImageEditNode:
             return config.get("provider_key", "modelscope")
         return "modelscope"
     
-    def call_dashscope_api(self, image_b64: Optional[str], prompt: str, model: str, api_key: str, 
-                        mask_b64: Optional[str] = None, **kwargs) -> Optional[str]:
+    def call_dashscope_api(self, image_b64: Optional[str], prompt: str, model: str, api_key: str, **kwargs) -> Optional[str]:
         """调用ModelScope API - 基于参考项目的图像编辑实现
         
         注意：ModelScope有内容过滤机制，可能会阻止某些提示词。
@@ -315,17 +406,11 @@ class APIImageEditNode:
                 print(f"[APIImageEdit] 纯文本生成模式")
             
             # 添加可选参数
-            if kwargs.get("negative_prompt"):
-                payload['negative_prompt'] = kwargs["negative_prompt"]
-                print(f"[APIImageEdit] 负向提示词: {kwargs['negative_prompt']}")
                 
             if kwargs.get("steps", 20) != 20:
                 payload['steps'] = kwargs["steps"]
                 print(f"[APIImageEdit] 采样步数: {kwargs['steps']}")
                 
-            if kwargs.get("guidance_scale", 3.5) != 3.5:
-                payload['guidance'] = kwargs["guidance_scale"]
-                print(f"[APIImageEdit] 引导系数: {kwargs['guidance_scale']}")
                 
             if kwargs.get("seed", -1) != -1:
                 payload['seed'] = kwargs["seed"]
@@ -470,8 +555,7 @@ class APIImageEditNode:
             
             return None
     
-    def call_openai_compatible_api(self, provider_name: str, image_b64: Optional[str], prompt: str, model: str, api_key: str,
-                                 mask_b64: Optional[str] = None, **kwargs) -> Optional[str]:
+    def call_openai_compatible_api(self, provider_name: str, image_b64: Optional[str], prompt: str, model: str, api_key: str, **kwargs) -> Optional[str]:
         """调用OpenAI兼容的API"""
         config = self.api_configs.get(provider_name)
         if not config:
@@ -515,14 +599,6 @@ class APIImageEditNode:
                 }
             ]
         
-        if mask_b64:
-            content.append({
-                "type": "image_url", 
-                "image_url": {
-                    "url": f"data:image/png;base64,{mask_b64}"
-                }
-            })
-            content[0]["text"] += " Use the second image as a mask to guide the editing."
         
         payload = {
             "model": model,
@@ -621,8 +697,7 @@ class APIImageEditNode:
         
         return None
     
-    def call_claude_api(self, image_b64: Optional[str], prompt: str, model: str, api_key: str,
-                       mask_b64: Optional[str] = None, **kwargs) -> Optional[str]:
+    def call_claude_api(self, image_b64: Optional[str], prompt: str, model: str, api_key: str, **kwargs) -> Optional[str]:
         """调用Claude API"""
         config = self.api_configs["Claude (Anthropic)"]
         headers = {
@@ -681,8 +756,8 @@ class APIImageEditNode:
         return None
     
     def call_gemini_api(self, image_b64: Optional[str], prompt: str, model: str, api_key: str,
-                       mask_b64: Optional[str] = None, **kwargs) -> Optional[str]:
-        """调用Gemini API - 使用官方google-genai库格式"""
+                       session_id: Optional[str] = None, conversation_mode: bool = True, **kwargs) -> Optional[str]:
+        """调用Gemini API - 支持多轮对话的图像编辑"""
         try:
             # 使用官方google-genai库 - 按照文档格式
             from google import genai
@@ -692,29 +767,76 @@ class APIImageEditNode:
             # 初始化客户端 - 按照官方文档
             client = genai.Client(api_key=api_key.strip())
             
-            # 构建输入内容 - 根据是否有图像输入
-            contents = []
-            
-            if image_b64:
-                # 图像编辑模式
-                image_data = base64.b64decode(image_b64)
-                contents = [
-                    types.Part.from_text(text=f"Edit this image: {prompt}"),
-                    types.Part.from_bytes(data=image_data, mime_type="image/jpeg"),
-                ]
-            else:
-                # 纯文本生成模式
-                contents = [
-                    types.Part.from_text(text=f"Generate an image: {prompt}")
-                ]
-            
             print(f"[APIImageEdit] 调用Gemini API (google-genai库): {model}")
+            print(f"[APIImageEdit] 对话模式: {'开启' if conversation_mode else '关闭'}")
+            print(f"[APIImageEdit] 会话ID: {session_id}")
             
-            # 调用API - 简化版本，让SDK处理默认配置
-            response = client.models.generate_content(
-                model=model,
-                contents=contents,
-            )
+            # 多轮对话支持
+            if conversation_mode and session_id:
+                # 使用Chat API进行多轮对话
+                if session_id not in self.conversation_sessions:
+                    # 创建新的聊天会话
+                    self.conversation_sessions[session_id] = client.chats.create(model=model)
+                    print(f"[APIImageEdit] 创建新的对话会话: {session_id}")
+                
+                chat_session = self.conversation_sessions[session_id]
+                
+                # 构建多模态消息
+                message_parts = []
+                
+                if image_b64:
+                    # 图像编辑模式
+                    image_data = base64.b64decode(image_b64)
+                    message_parts = [
+                        f"Edit this image: {prompt}",
+                        types.Part.from_bytes(data=image_data, mime_type="image/jpeg")
+                    ]
+                else:
+                    # 纯文本生成模式 - 检查历史中是否有图像
+                    history = self.get_conversation_history(session_id)
+                    if history['images']:
+                        # 使用最后一张图像继续编辑
+                        last_image = history['images'][-1]
+                        image_data = base64.b64decode(last_image['image_b64'])
+                        message_parts = [
+                            f"Continue editing the previous image: {prompt}",
+                            types.Part.from_bytes(data=image_data, mime_type="image/jpeg")
+                        ]
+                        print(f"[APIImageEdit] 使用历史图像继续编辑")
+                    else:
+                        message_parts = [f"Generate an image: {prompt}"]
+                
+                # 发送消息到聊天会话
+                response = chat_session.send_message(message_parts)
+                
+            else:
+                # 单次API调用模式（原有逻辑）
+                contents = []
+                
+                if image_b64:
+                    # 图像编辑模式
+                    image_data = base64.b64decode(image_b64)
+                    contents = [
+                        types.Part.from_text(text=f"Edit this image: {prompt}"),
+                        types.Part.from_bytes(data=image_data, mime_type="image/jpeg"),
+                    ]
+                else:
+                    # 纯文本生成模式
+                    contents = [
+                        types.Part.from_text(text=f"Generate an image: {prompt}")
+                    ]
+                
+                # 调用API - 使用正确的Gemini参数
+                from google.genai import types
+                config = None
+                if kwargs.get("gemini_params", {}).get("generation_config"):
+                    config = types.GenerateContentConfig(**kwargs["gemini_params"]["generation_config"])
+                
+                response = client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=config
+                )
             
             print(f"[APIImageEdit] Gemini API响应成功")
             
@@ -724,7 +846,15 @@ class APIImageEditNode:
                     # 检查图像数据
                     if hasattr(part, 'inline_data') and part.inline_data:
                         print("[APIImageEdit] 从Gemini获取到编辑后的图片")
-                        return base64.b64encode(part.inline_data.data).decode('utf-8')
+                        result_b64 = base64.b64encode(part.inline_data.data).decode('utf-8')
+                        
+                        # 保存到对话历史
+                        if conversation_mode and session_id:
+                            response_text = getattr(response, 'text', 'Image generated successfully')
+                            self.add_to_conversation_history(session_id, prompt, response_text, result_b64)
+                            print(f"[APIImageEdit] 对话历史已更新")
+                        
+                        return result_b64
                     # 检查文本响应
                     elif hasattr(part, 'text') and part.text:
                         print(f"[APIImageEdit] Gemini响应文本: {part.text[:200]}...")
@@ -732,6 +862,17 @@ class APIImageEditNode:
             # 如果没有图像输出，尝试获取响应文本
             if hasattr(response, 'text') and response.text:
                 print(f"[APIImageEdit] Gemini完整文本响应: {response.text}")
+                
+                # 即使没有图像输出，也保存对话历史
+                if conversation_mode and session_id:
+                    self.add_to_conversation_history(session_id, prompt, response.text)
+                
+                # 如果是不支持图像生成的模型，但在对话模式下，尝试使用最后一张图像
+                if conversation_mode and session_id:
+                    history = self.get_conversation_history(session_id)
+                    if history['images'] and image_b64:
+                        print(f"[APIImageEdit] 模型不支持图像生成，返回输入图像以保持对话连续性")
+                        return image_b64
             
             print("[APIImageEdit] 警告: Gemini响应中未找到图像数据")
             return None
@@ -739,15 +880,14 @@ class APIImageEditNode:
         except ImportError:
             print("[APIImageEdit] 错误: 需要安装google-genai库: pip install google-genai")
             # 回退到原来的REST API方式
-            return self._call_gemini_rest_api(image_b64, prompt, model, api_key, mask_b64, **kwargs)
+            return self._call_gemini_rest_api(image_b64, prompt, model, api_key, **kwargs)
         except Exception as e:
             print(f"[APIImageEdit] Gemini API调用异常: {str(e)}")
             # 如果google-genai库调用失败，尝试REST API
             print("[APIImageEdit] 尝试回退到REST API方式...")
-            return self._call_gemini_rest_api(image_b64, prompt, model, api_key, mask_b64, **kwargs)
+            return self._call_gemini_rest_api(image_b64, prompt, model, api_key, **kwargs)
     
-    def _call_gemini_rest_api(self, image_b64: Optional[str], prompt: str, model: str, api_key: str,
-                             mask_b64: Optional[str] = None, **kwargs) -> Optional[str]:
+    def _call_gemini_rest_api(self, image_b64: Optional[str], prompt: str, model: str, api_key: str, **kwargs) -> Optional[str]:
         """Gemini REST API回退方法"""
         config = self.api_configs["Google Gemini"]
         
@@ -846,10 +986,42 @@ class APIImageEditNode:
             return None
     
     def edit_image(self, api_provider, api_key, model, prompt, refresh_models=False, 
-                  image1=None, image2=None, image3=None, image4=None, mask=None, 
-                  strength=1.0, guidance_scale=7.5, steps=20, seed=-1, 
-                  watermark=False, negative_prompt=""):
-        """主要的图像编辑函数"""
+                  image1=None, image2=None, image3=None, image4=None, 
+ 
+                  watermark=False, generation_mode="single", image_count=1,
+                  conversation_mode=True, reset_conversation=False, use_last_image=False):
+        """主要的图像编辑函数 - 支持多轮对话"""
+        
+        # 处理对话控制
+        if reset_conversation:
+            self.reset_conversation()
+            print("[APIImageEdit] 对话已重置")
+        
+        # 获取或创建会话ID
+        session_id = self.get_or_create_session_id() if conversation_mode else None
+        
+        # 更新历史记录显示
+        if conversation_mode and session_id:
+            history = self.get_conversation_history(session_id)
+            
+            # 生成聊天历史显示文本
+            chat_display = []
+            for i, msg in enumerate(history['messages'][-10:]):  # 只显示最近10条
+                role_icon = "🤖" if msg['role'] == 'model' else "👤"
+                chat_display.append(f"{role_icon} {msg['content'][:100]}...")
+            
+            # 生成编辑历史显示文本  
+            edit_display = []
+            for i, img in enumerate(history['images'][-5:]):  # 只显示最近5张
+                timestamp = time.strftime("%H:%M:%S", time.localtime(img['timestamp']))
+                edit_display.append(f"🎨 {timestamp}: {img['prompt'][:80]}...")
+            
+            # 更新显示内容（注意：这只是为了调试，ComfyUI界面更新需要特殊处理）
+            current_chat_history = "\n".join(chat_display) if chat_display else "暂无聊天记录"
+            current_edit_history = "\n".join(edit_display) if edit_display else "暂无编辑记录"
+            
+            print(f"[APIImageEdit] 当前聊天历史: {len(history['messages'])}条消息")
+            print(f"[APIImageEdit] 当前编辑历史: {len(history['images'])}张图像")
         
         if not api_key or not api_key.strip():
             print("Error: API key is required")
@@ -871,6 +1043,13 @@ class APIImageEditNode:
             print(f"[APIImageEdit] 请在界面中选择正确的模型")
             default_image = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
             return (default_image,)
+        
+        # 检查模型是否支持图像生成（多轮对话需要）
+        supports_image_gen = self.is_image_generation_model(api_provider, model)
+        if conversation_mode and not supports_image_gen:
+            print(f"[APIImageEdit] 警告: 模型 '{model}' 不支持图像生成，多轮对话功能可能无法正常工作")
+            print(f"[APIImageEdit] 推荐使用图像生成模型如: gemini-2.5-flash-image-preview")
+            # 继续执行，但用户会看到警告
         
         # 模型列表由前端管理，这里只做基本检查
         if not model.strip():
@@ -896,48 +1075,75 @@ class APIImageEditNode:
         # 处理多个可选图像输入
         images = [img for img in [image1, image2, image3, image4] if img is not None]
         
-        # 判断生成模式
-        if not images:
-            # 纯文本生成模式
-            print(f"[APIImageEdit] 纯文本生成模式: {prompt}")
-            mode = "text_to_image"
-            image_b64 = None
-        elif len(images) == 1:
-            # 单图编辑模式
-            print(f"[APIImageEdit] 单图编辑模式")
-            mode = "image_to_image"
-            pil_image = self.tensor_to_pil(images[0])
-            image_b64 = self.image_to_base64(pil_image)
+        # 多轮对话模式下的图像处理
+        if conversation_mode and session_id:
+            history = self.get_conversation_history(session_id)
+            
+            if use_last_image and history['images'] and not images:
+                # 使用历史图像进行对话编辑
+                last_image = history['images'][-1]
+                image_b64 = last_image['image_b64']
+                print(f"[APIImageEdit] 使用历史图像进行对话编辑 (来自: {last_image['prompt'][:50]}...)")
+                mode = "conversation_edit"
+            elif images:
+                # 有新图像输入，使用新图像
+                mode = "image_to_image" if len(images) == 1 else "multi_image"
+                pil_image = self.tensor_to_pil(images[0])
+                image_b64 = self.image_to_base64(pil_image)
+                if len(images) > 1:
+                    multi_image_prompt = f"Based on the provided {len(images)} images, {prompt}"
+                    prompt = multi_image_prompt
+                print(f"[APIImageEdit] 对话模式 - 使用新输入图像")
+            else:
+                # 没有图像输入，也没有历史图像或未启用use_last_image
+                if not history['images']:
+                    print(f"[APIImageEdit] 对话模式下的纯文本生成: {prompt}")
+                    mode = "conversation_text_to_image"
+                    image_b64 = None
+                else:
+                    print(f"[APIImageEdit] 提示: 启用 'use_last_image' 可以基于历史图像继续编辑")
+                    mode = "conversation_text_to_image"
+                    image_b64 = None
         else:
-            # 多图合成模式
-            print(f"[APIImageEdit] 多图合成模式，输入图像数量: {len(images)}")
-            mode = "multi_image"
-            # 处理多张图像，这里使用第一张作为主图，其他作为参考
-            pil_image = self.tensor_to_pil(images[0])
-            image_b64 = self.image_to_base64(pil_image)
-            
-            # 增强提示词以包含多图信息
-            multi_image_prompt = f"Based on the provided {len(images)} images, {prompt}"
-            prompt = multi_image_prompt
+            # 原有逻辑：非对话模式或未启用使用历史图像
+            if not images:
+                # 纯文本生成模式
+                print(f"[APIImageEdit] 纯文本生成模式: {prompt}")
+                mode = "text_to_image"
+                image_b64 = None
+            elif len(images) == 1:
+                # 单图编辑模式
+                print(f"[APIImageEdit] 单图编辑模式")
+                mode = "image_to_image"
+                pil_image = self.tensor_to_pil(images[0])
+                image_b64 = self.image_to_base64(pil_image)
+            else:
+                # 多图合成模式
+                print(f"[APIImageEdit] 多图合成模式，输入图像数量: {len(images)}")
+                mode = "multi_image"
+                # 处理多张图像，这里使用第一张作为主图，其他作为参考
+                pil_image = self.tensor_to_pil(images[0])
+                image_b64 = self.image_to_base64(pil_image)
+                
+                # 增强提示词以包含多图信息
+                multi_image_prompt = f"Based on the provided {len(images)} images, {prompt}"
+                prompt = multi_image_prompt
         
-        mask_b64 = None
-        if mask is not None:
-            mask_array = mask.cpu().numpy()
-            if mask_array.ndim == 3:
-                mask_array = mask_array[0]
-            
-            mask_pil = Image.fromarray((mask_array * 255).astype(np.uint8), mode='L')
-            mask_pil = mask_pil.convert('RGB')
-            mask_b64 = self.image_to_base64(mask_pil)
         
+        # 构建正确的Gemini API参数（移除无效参数）
+        gemini_params = {}
+        if api_provider == "Google Gemini":
+            # Gemini只支持这些参数
+            generation_config = {}
+            if steps > 20:
+                generation_config["maxOutputTokens"] = min(steps * 50, 8192)  # 粗略映射
+            gemini_params["generation_config"] = generation_config
+        
+        # 其他API保持原有参数结构
         kwargs = {
-            "mask_b64": mask_b64,
-            "strength": strength,
-            "guidance_scale": guidance_scale,
-            "steps": steps,
-            "seed": seed if seed >= 0 else None,
+ 
             "watermark": watermark,
-            "negative_prompt": negative_prompt
+            "gemini_params": gemini_params
         }
         
         print(f"[APIImageEdit] 调用 {api_provider} API，模型: {model}")
@@ -959,7 +1165,8 @@ class APIImageEditNode:
         elif api_type == "claude":
             result_b64 = self.call_claude_api(image_b64, prompt, model, api_key, **kwargs)
         elif api_type == "gemini":
-            result_b64 = self.call_gemini_api(image_b64, prompt, model, api_key, **kwargs)
+            result_b64 = self.call_gemini_api(image_b64, prompt, model, api_key, 
+                                            session_id=session_id, conversation_mode=conversation_mode, **kwargs)
         else:
             print(f"Unsupported API type: {api_type}")
             default_image = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
