@@ -12,7 +12,7 @@ import os
 import importlib.util
 import traceback
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"  # Fixed UnboundLocalError in single mode
 __author__ = "User"
 __description__ = "ComfyUI Custom Nodes for API-based Image Editing"
 

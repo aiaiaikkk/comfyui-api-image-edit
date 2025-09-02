@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "comfyui-api-image-edit"
-version = "1.0.0"
+version = "1.0.1"
 description = "A powerful ComfyUI custom node for API-based image editing with multiple provider support"
 readme = "README.md"
 license = {text = "MIT License"}
@@ -47,7 +47,7 @@ dependencies = [
     "Pillow>=8.0.0",
     "numpy>=1.19.0",
     "torch>=1.9.0",
-    "google-generativeai>=0.7.0",
+    "google-genai>=1.32.0",
 ]
 
 [project.optional-dependencies]
