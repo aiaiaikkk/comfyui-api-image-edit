@@ -3,9 +3,13 @@ on:
   workflow_dispatch:
   push:
     branches:
+      - master
       - main
     paths:
       - "pyproject.toml"
+  push:
+    tags:
+      - 'v*'
 
 jobs:
   publish-node:
