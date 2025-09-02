@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "comfyui-api-image-edit"
-version = "1.0.3"
+version = "1.0.4"
 description = "A powerful ComfyUI custom node for API-based image editing with multiple provider support"
 readme = "README.md"
 license = {text = "MIT License"}
