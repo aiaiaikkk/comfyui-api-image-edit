@@ -128,7 +128,6 @@ class ModelFetcher {
             this.cache.set(cacheKey, models);
             return models;
         } catch (error) {
-            console.warn(`[APIImageEdit] 获取${provider}模型失败:`, error);
             return config.models || [];
         } finally {
             this.fetchPromises.delete(cacheKey);
@@ -144,7 +143,6 @@ class ModelFetcher {
             return await this._fetchClaudeModels(apiKey);
         } else if (provider === 'modelscope') {
             // ModelScope doesn't have a models API endpoint, return default models
-            console.log("[APIImageEdit] ModelScope使用预定义模型列表");
             return config.models || [];
         } else if (provider === 'pixelwords') {
             return await this._fetchPixelWordsModels(apiKey);
@@ -223,7 +221,6 @@ class ModelFetcher {
                    id.includes('chat-seedream') || id.includes('api-images');
         }).map(model => model.id) || [];
         
-        console.log(`[APIImageEdit] PixelWords获取到 ${imageModels.length} 个图像模型:`, imageModels.slice(0, 5));
         return imageModels;
     }
 
@@ -258,7 +255,6 @@ app.registerExtension({
     },
 
     enhanceAPIImageEditNode(node) {
-        console.log("[APIImageEdit] 增强节点UI，匹配参考项目设计");
         
         // 找到widgets
         const providerWidget = node.widgets?.find(w => w.name === "api_provider");
@@ -267,7 +263,6 @@ app.registerExtension({
         const refreshWidget = node.widgets?.find(w => w.name === "refresh_models");
 
         if (!providerWidget || !keyWidget || !modelWidget) {
-            console.warn("[APIImageEdit] 找不到必要的widgets");
             return;
         }
 
@@ -303,7 +298,6 @@ app.registerExtension({
         // 监听提供商变化
         const originalCallback = providerWidget.callback;
         providerWidget.callback = (value) => {
-            console.log(`[APIImageEdit] 🔄 提供商切换: ${providerWidget._previousValue || '未知'} -> ${value}`);
             
             if (originalCallback) {
                 originalCallback.call(providerWidget, value);
@@ -314,7 +308,6 @@ app.registerExtension({
             const newProviderKey = this.getProviderKeyFromName(value);
             
             if (keyWidget._realValue && currentProviderKey !== newProviderKey && providerWidget._previousValue) {
-                console.log(`[APIImageEdit] 💾 保存 ${currentProviderKey} 的API密钥: ${keyWidget._realValue.substring(0, 10)}...`);
                 keyManager.saveKey(currentProviderKey, keyWidget._realValue);
             }
             
@@ -325,7 +318,6 @@ app.registerExtension({
             // 恢复新提供商的保存密钥
             const savedKey = keyManager.getKey(providerKey);
             if (savedKey) {
-                console.log(`[APIImageEdit] 恢复 ${providerKey} 的API密钥`);
                 keyWidget.value = savedKey;
                 keyWidget._realValue = savedKey;
                 keyWidget._isHidden = false;
@@ -366,14 +358,12 @@ app.registerExtension({
         // 简化方案：重写serialize方法
         const originalSerialize = keyWidget.serialize;
         keyWidget.serialize = function() {
-            console.log(`[APIImageEdit] 🔍 SERIALIZE被调用! value: "${this.value}", _realValue: "${this._realValue}", _isHidden: ${this._isHidden}`);
             const result = originalSerialize ? originalSerialize.call(this) : this.value;
+            
             // 如果当前显示的是●掩码，返回真实值
             if (this.value && this.value.match(/^●+$/) && this._realValue) {
-                console.log('[APIImageEdit] ✅ 序列化时使用真实API key');
                 return this._realValue;
             }
-            console.log('[APIImageEdit] ⚠️ 序列化时使用显示值');
             return result;
         };
         
@@ -381,6 +371,42 @@ app.registerExtension({
         if (!keyWidget.serializeValue) {
             keyWidget.serializeValue = keyWidget.serialize;
         }
+        
+        // 重写getValue方法（ComfyUI可能使用这个）
+        const originalGetValue = keyWidget.getValue;
+        keyWidget.getValue = function() {
+            if (this.value && this.value.match(/^●+$/) && this._realValue) {
+                return this._realValue;
+            }
+            
+            const result = originalGetValue ? originalGetValue.call(this) : this.value;
+            return result;
+        };
+        
+        // 直接劫持value getter/setter（最终解决方案）
+        Object.defineProperty(keyWidget, '_hiddenValue', {
+            value: keyWidget.value,
+            writable: true,
+            enumerable: false
+        });
+        
+        Object.defineProperty(keyWidget, 'value', {
+            get: function() {
+                if (this._isHidden && this._realValue) {
+                    return this._realValue;
+                } else {
+                    return this._hiddenValue;
+                }
+            },
+            set: function(newValue) {
+                this._hiddenValue = newValue;
+                if (this.inputEl) {
+                    this.inputEl.value = newValue;
+                }
+            },
+            enumerable: true,
+            configurable: true
+        });
 
         // 监听密钥变化
         const originalCallback = keyWidget.callback;
@@ -406,7 +432,6 @@ app.registerExtension({
                 // 更新模型列表
                 const modelWidget = node.widgets?.find(w => w.name === "model");
                 if (modelWidget) {
-                    console.log(`[APIImageEdit] API key变化，刷新模型列表: ${providerKey}`);
                     this.updateModelList(node, providerKey, value.trim(), modelWidget, true);
                 }
                 
@@ -437,10 +462,10 @@ app.registerExtension({
     hideAPIKey(keyWidget) {
         if (keyWidget._realValue && keyWidget._realValue.length > 0 && !keyWidget._isHidden) {
             const hiddenValue = '●'.repeat(Math.min(keyWidget._realValue.length, 20));
-            // 直接设置value而不是_displayValue
-            keyWidget.value = hiddenValue;
+            // 设置隐藏状态
             keyWidget._isHidden = true;
-            console.log(`[APIImageEdit] API key已隐藏: ${hiddenValue}`);
+            // 设置_hiddenValue为圆点符号（仅用于显示）
+            keyWidget._hiddenValue = hiddenValue;
             
             // 手动更新DOM显示
             if (keyWidget.inputEl) {
@@ -451,7 +476,8 @@ app.registerExtension({
 
     // 获取真实的API Key值
     getRealAPIKey(keyWidget) {
-        return keyWidget._realValue || keyWidget.value;
+        const result = keyWidget._realValue || keyWidget.value;
+        return result;
     },
 
     enhanceModelWidget(node, modelWidget, providerWidget, keyWidget) {
@@ -466,7 +492,6 @@ app.registerExtension({
         if (!config) return;
 
         try {
-            console.log(`[APIImageEdit] 更新${config.name}模型列表，provider: ${providerKey}`);
             
             // 显示加载状态
             this.setModelLoadingState(modelWidget, true);
@@ -484,7 +509,7 @@ app.registerExtension({
                         models = dynamicModels;
                     }
                 } catch (error) {
-                    console.warn(`[APIImageEdit] 动态获取模型失败，使用默认模型:`, error);
+                    // 使用默认模型作为fallback
                 }
             }
 
@@ -494,8 +519,6 @@ app.registerExtension({
                 
                 // 选择第一个模型
                 modelWidget.value = models[0];
-                
-                console.log(`[APIImageEdit] 成功更新${config.name}模型列表:`, models);
             }
 
         } catch (error) {
@@ -550,7 +573,6 @@ app.registerExtension({
             // 恢复API key
             const savedKey = keyManager.getKey(savedProvider);
             if (savedKey) {
-                console.log(`[APIImageEdit] 初始化时恢复 ${savedProvider} 的API密钥`);
                 keyWidget.value = savedKey;
                 keyWidget._realValue = savedKey;
                 keyWidget._isHidden = false;
@@ -566,7 +588,6 @@ app.registerExtension({
             // 配置占位符在ComfyUI中通过其他方式处理
             
             // 强制更新模型列表以匹配当前提供商
-            console.log(`[APIImageEdit] 初始化节点，provider: ${savedProvider}`);
             await this.updateModelList(node, savedProvider, savedKey, modelWidget, true);
             
             // 隐藏API key
@@ -607,7 +628,6 @@ app.registerExtension({
             }
             
             if (value === true) {
-                console.log("[APIImageEdit] 手动刷新模型列表");
                 const providerKey = this.getProviderKeyFromName(providerWidget.value);
                 const apiKey = keyWidget._realValue || keyWidget.value;
                 
@@ -622,4 +642,3 @@ app.registerExtension({
     }
 });
 
-console.log("[APIImageEdit] UI扩展已加载，完全匹配参考项目设计");

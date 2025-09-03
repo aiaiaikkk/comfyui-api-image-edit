@@ -26,6 +26,7 @@ class APIImageEditNode:
     FUNCTION = "edit_image"
     CATEGORY = "API/Image Edit"
     
+    
     @classmethod
     def get_provider_models(cls):
         """获取按提供商分类的图像模型字典"""
@@ -105,6 +106,18 @@ class APIImageEditNode:
                 "glm-4v",
                 "llava-v1.6-34b",
                 "playground-v2-1024px-aesthetic"
+            ],
+            "Custom": [
+                "custom-model-1",
+                "custom-model-2", 
+                "custom-model-3",
+                "gpt-4o",
+                "gpt-4o-mini",
+                "claude-3-5-sonnet",
+                "gemini-2.5-flash",
+                "dall-e-3",
+                "stable-diffusion-3.5",
+                "flux-1-pro"
             ]
         }
     
@@ -147,6 +160,7 @@ class APIImageEditNode:
         """为指定提供商更新模型列表 - ComfyUI前端可调用此方法"""
         models = cls.get_models_for_provider(provider)
         return models
+    
     
     def get_widget_values(self, node_inputs):
         """ComfyUI动态输入支持 - 根据api_provider动态更新model选项"""
@@ -245,17 +259,19 @@ class APIImageEditNode:
             "OpenRouter", 
             "OpenAI",
             "Google Gemini",
-            "PixelWords"
+            "PixelWords",
+            "Custom"
         ]
         
-        # 获取所有提供商的模型列表，防止验证错误
+        # 获取所有提供商的模型列表
         all_provider_models = cls.get_provider_models()
         all_models = []
         
         # 添加所有模型，按提供商分组
-        for provider, models in all_provider_models.items():
+        for provider in provider_names:
+            provider_models = cls.get_models_for_provider(provider)
             all_models.append(f"--- {provider} ---")
-            all_models.extend(models)
+            all_models.extend(provider_models)
         
         return {
             "required": {
@@ -263,7 +279,6 @@ class APIImageEditNode:
                 "api_key": ("STRING", {"default": "", "multiline": False, "placeholder": "输入API密钥/访问令牌..."}),
                 "model": (all_models, {"default": "Qwen/Qwen-Image-Edit"}),
                 "prompt": ("STRING", {"default": "Generate or edit images based on the provided inputs", "multiline": True}),
-                "refresh_models": ("BOOLEAN", {"default": False}),
             },
             "optional": {
                 "image1": ("IMAGE",),
@@ -277,7 +292,8 @@ class APIImageEditNode:
                 "chat_history": ("STRING", {"default": "", "multiline": True, "placeholder": "选择chat模式时显示聊天历史\n（自动更新，通常无需手动输入）"}),
                 "edit_history": ("STRING", {"default": "", "multiline": True, "placeholder": "选择edit_history模式时显示编辑历史\n（自动更新，通常无需手动输入）"}),
                 "reset_chat": ("BOOLEAN", {"default": False, "label_on": "重置聊天", "label_off": "保持聊天"}),
-                "backup_api_url": ("STRING", {"default": "", "multiline": False, "placeholder": "备用API地址 (可选，如: https://api.backup-provider.com)"}),
+                "backup_api_url": ("STRING", {"default": "", "multiline": False, "placeholder": "备用API地址或自定义API地址 (如: https://api.custom-provider.com)"}),
+                "custom_model": ("STRING", {"default": "", "multiline": False, "placeholder": "自定义模型名称 (仅当选择Custom提供商时使用)"}),
             }
         }
     
@@ -317,6 +333,12 @@ class APIImageEditNode:
                 "base_url": "https://api.sydney-ai.com/v1",
                 "edit_endpoint": "/chat/completions",
                 "type": "openai_compatible"
+            },
+            "Custom": {
+                "provider_key": "custom",
+                "base_url": "",  # 将由backup_api_url填充
+                "edit_endpoint": "/chat/completions",  # 使用chat/completions端点
+                "type": "openai_compatible"  # 默认使用OpenAI兼容格式
             }
         }
         self._model_cache = {}
@@ -657,15 +679,31 @@ class APIImageEditNode:
             ]
         
         
-        payload = {
-            "model": model,
-            "messages": [
-                {
-                    "role": "user", 
-                    "content": content
+        # 根据端点类型选择不同的请求格式
+        if config["edit_endpoint"] == "/completions":
+            # 使用completions格式
+            if image_b64:
+                payload = {
+                    "model": model,
+                    "prompt": f"Please edit this image according to the following instructions: {prompt}. Generate a new edited version of the image.",
+                    "image": image_b64
                 }
-            ]
-        }
+            else:
+                payload = {
+                    "model": model,
+                    "prompt": f"Please generate an image according to the following description: {prompt}."
+                }
+        else:
+            # 使用chat/completions格式
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user", 
+                        "content": content
+                    }
+                ]
+            }
         
         # 添加seed参数（如果API支持）
         if "seed" in kwargs and kwargs["seed"] is not None:
@@ -674,13 +712,52 @@ class APIImageEditNode:
         
         try:
             url = config["base_url"] + config["edit_endpoint"]
-            # 使用UTF-8编码避免中文字符问题
+            # 使用session来避免编码问题
+            session = requests.Session()
+            session.headers.update({'User-Agent': 'ComfyUI/1.0'})
+            
+            # 手动编码JSON数据以确保UTF-8编码
             json_data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
-            headers_copy = headers.copy()
-            response = requests.post(url, data=json_data, headers=headers_copy, timeout=60)
+            
+            # 复制headers并确保安全编码
+            safe_headers = {}
+            for key, value in headers.items():
+                try:
+                    if key == "Authorization":
+                        # 特殊处理Authorization header，确保编码安全
+                        if isinstance(value, str):
+                            # 检查是否包含圆点符号，如果是则提前报错
+                            if '●' in value:
+                                print(f"[APIImageEdit] 错误：Authorization header包含无效字符(圆点符号)")
+                                raise ValueError("Invalid API key format")
+                            # 确保只包含ASCII字符
+                            safe_headers[key] = value.encode('ascii', errors='strict').decode('ascii')
+                        else:
+                            safe_headers[key] = str(value)
+                    else:
+                        # 其他header的处理
+                        if isinstance(value, str):
+                            safe_headers[key] = value.encode('ascii', errors='ignore').decode('ascii')
+                        else:
+                            safe_headers[key] = str(value)
+                except (UnicodeEncodeError, UnicodeDecodeError, ValueError) as e:
+                    print(f"[APIImageEdit] Header编码错误 {key}: {e}")
+                    if key == "Authorization":
+                        # Authorization header编码失败，直接返回错误
+                        print(f"[APIImageEdit] ❌ API密钥包含无效字符，无法编码")
+                        return None
+                    safe_headers[key] = str(value)
+            
+            response = session.post(url, data=json_data, headers=safe_headers, timeout=60)
             
             if response.status_code == 200:
-                data = response.json()
+                try:
+                    data = response.json()
+                except json.JSONDecodeError as e:
+                    print(f"[APIImageEdit] {provider_name} API返回非JSON响应: {e}")
+                    print(f"[APIImageEdit] 响应内容类型: {response.headers.get('content-type', 'unknown')}")
+                    print(f"[APIImageEdit] 响应前500字符: {response.text[:500]}")
+                    return None
                 
                 if "choices" in data and data["choices"]:
                     choice = data["choices"][0]
@@ -767,7 +844,38 @@ class APIImageEditNode:
                     return None
                             
             else:
-                print(f"{provider_name} API error: {response.status_code} - {response.text}")
+                print(f"[APIImageEdit] {provider_name} API请求失败: HTTP {response.status_code}")
+                print(f"[APIImageEdit] 请求URL: {url}")
+                print(f"[APIImageEdit] 响应内容类型: {response.headers.get('content-type', 'unknown')}")
+                print(f"[APIImageEdit] 错误详情: {response.text[:1000]}")
+                
+                # 检查是否是特定错误类型
+                error_text = response.text.lower()
+                
+                if response.status_code == 400:
+                    # 专门检查地理位置限制
+                    if ("location is not supported" in error_text or 
+                        "user location" in error_text or 
+                        "failed_precondition" in error_text):
+                        print(f"[APIImageEdit] 🌍 地理位置限制: 该模型在您所在地区不可用")
+                        print(f"[APIImageEdit] 💡 建议: 请尝试使用其他没有地区限制的模型，如:")
+                        print(f"[APIImageEdit]     - meta-llama/llama-3.2-90b-vision-instruct:free") 
+                        print(f"[APIImageEdit]     - anthropic/claude-3-5-sonnet:beta")
+                        print(f"[APIImageEdit]     - OpenAI的gpt-4-vision-preview")
+                        return None
+                
+                if response.status_code == 401:
+                    print(f"[APIImageEdit] ❌ 认证失败: 请检查API密钥是否正确")
+                elif response.status_code == 403:
+                    print(f"[APIImageEdit] ❌ 权限不足: 请检查API密钥权限或账户余额")
+                elif response.status_code == 404:
+                    print(f"[APIImageEdit] ❌ 端点不存在: 请检查API地址和端点配置是否正确")
+                elif response.status_code == 429:
+                    print(f"[APIImageEdit] ❌ 请求频率过高: 请稍后重试")
+                elif response.status_code >= 500:
+                    print(f"[APIImageEdit] ❌ 服务器错误: API服务暂时不可用")
+                
+                return None
                 
         except Exception as e:
             print(f"Error calling {provider_name} API: {e}")
@@ -777,10 +885,11 @@ class APIImageEditNode:
     def call_claude_api(self, image_b64: Optional[str], prompt: str, model: str, api_key: str, **kwargs) -> Optional[str]:
         """调用Claude API"""
         config = self.api_configs["Claude (Anthropic)"]
+        
         headers = {
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
-            "content-type": "application/json"
+            "content-type": "application/json; charset=utf-8"
         }
         
         content = [
@@ -811,7 +920,26 @@ class APIImageEditNode:
         
         try:
             url = config["base_url"] + config["edit_endpoint"]
-            response = requests.post(url, headers=headers, json=payload, timeout=60)
+            # 使用session来避免编码问题
+            session = requests.Session()
+            session.headers.update({'User-Agent': 'ComfyUI/1.0'})
+            
+            # 手动编码JSON数据以确保UTF-8编码
+            json_data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+            
+            # 复制headers并确保安全编码
+            safe_headers = {}
+            for key, value in headers.items():
+                try:
+                    # 尝试将header值转换为安全的ASCII格式
+                    if isinstance(value, str):
+                        safe_headers[key] = value.encode('ascii', errors='ignore').decode('ascii')
+                    else:
+                        safe_headers[key] = str(value)
+                except:
+                    safe_headers[key] = str(value)
+            
+            response = session.post(url, data=json_data, headers=safe_headers, timeout=60)
             
             if response.status_code == 200:
                 data = response.json()
@@ -1071,7 +1199,7 @@ class APIImageEditNode:
         url = f"{config['base_url']}/{model}{config['edit_endpoint']}"
         
         headers = {
-            "Content-Type": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
             "X-goog-api-key": api_key.strip()
         }
         
@@ -1122,7 +1250,26 @@ class APIImageEditNode:
         
         try:
             print(f"[APIImageEdit] 调用Gemini REST API (回退方式): {model}")
-            response = requests.post(url, headers=headers, json=request_data, timeout=120)
+            # 使用session来避免编码问题
+            session = requests.Session()
+            session.headers.update({'User-Agent': 'ComfyUI/1.0'})
+            
+            # 手动编码JSON数据以确保UTF-8编码
+            json_data = json.dumps(request_data, ensure_ascii=False).encode('utf-8')
+            
+            # 复制headers并确保安全编码
+            safe_headers = {}
+            for key, value in headers.items():
+                try:
+                    # 尝试将header值转换为安全的ASCII格式
+                    if isinstance(value, str):
+                        safe_headers[key] = value.encode('ascii', errors='ignore').decode('ascii')
+                    else:
+                        safe_headers[key] = str(value)
+                except:
+                    safe_headers[key] = str(value)
+            
+            response = session.post(url, data=json_data, headers=safe_headers, timeout=120)
             
             if response.status_code == 200:
                 result = response.json()
@@ -1148,7 +1295,7 @@ class APIImageEditNode:
                                     print("[APIImageEdit] 从Gemini获取到编辑后的图片（inline_data）")
                                     return inline_data["data"]
                             
-                            # 提取文本响应（用于调试）
+                            # 提取文本响应
                             if "text" in part:
                                 text_content = part["text"]
                                 print(f"[APIImageEdit] Gemini文本响应: {text_content[:200]}...")
@@ -1167,10 +1314,10 @@ class APIImageEditNode:
             traceback.print_exc()
             return None
     
-    def edit_image(self, api_provider, api_key, model, prompt, refresh_models=False, 
+    def edit_image(self, api_provider, api_key, model, prompt,
                   image1=None, image2=None, image3=None, image4=None,
                   generation_mode="single", image_count=1, seed=-1,
-                  chat_history="", edit_history="", reset_chat=False, backup_api_url=""):
+                  chat_history="", edit_history="", reset_chat=False, backup_api_url="", custom_model=""):
         """主要的图像编辑函数 - 支持多轮对话"""
         
         # 处理seed参数 - 支持随机抽卡
@@ -1201,7 +1348,7 @@ class APIImageEditNode:
                 timestamp = time.strftime("%H:%M:%S", time.localtime(img['timestamp']))
                 edit_display.append(f"🎨 {timestamp}: {img['prompt'][:80]}...")
             
-            # 更新显示内容（注意：这只是为了调试，ComfyUI界面更新需要特殊处理）
+            # 更新显示内容
             current_chat_history = "\n".join(chat_display) if chat_display else "暂无聊天记录"
             current_edit_history = "\n".join(edit_display) if edit_display else "暂无编辑记录"
             
@@ -1213,6 +1360,13 @@ class APIImageEditNode:
             # 创建一个默认的黑色图像作为错误返回
             default_image = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
             return (default_image, "API密钥未提供")
+            
+        # 检查API密钥是否是前端隐藏的圆点符号
+        if api_key.strip() and all(c == '●' for c in api_key.strip()):
+            print("Error: API key appears to be masked with dots (●). Please enter your real API key.")
+            print("提示：看起来您输入的是被隐藏的API密钥。请重新输入真实的API密钥。")
+            default_image = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
+            return (default_image, "API密钥格式错误：请输入真实的API密钥，而不是圆点符号")
         
         # 验证选择的模型是否属于当前API提供商
         valid_models = self.get_models_for_provider(api_provider)
@@ -1220,14 +1374,27 @@ class APIImageEditNode:
         if model.startswith("---") and model.endswith("---"):
             print(f"[APIImageEdit] 错误: 请选择具体的模型，而不是分隔符 '{model}'")
             default_image = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
-            return (default_image, "API密钥未提供")
+            return (default_image, "请选择具体的模型，而不是分隔符")
         
-        if model not in valid_models:
+        # 自定义提供商的特殊处理
+        if api_provider == "Custom":
+            if custom_model.strip():
+                # 如果用户提供了自定义模型名称，优先使用
+                model = custom_model.strip()
+                print(f"[APIImageEdit] 使用用户指定的自定义模型: {model}")
+            elif model in valid_models:
+                # 如果选择的是预定义的自定义模型列表中的模型，直接使用
+                print(f"[APIImageEdit] 使用预定义的自定义模型: {model}")
+            else:
+                # 如果模型不在列表中，但在自定义提供商模式下，仍然允许使用
+                print(f"[APIImageEdit] 自定义提供商模式：允许使用模型 '{model}'")
+                print(f"[APIImageEdit] 提示：建议在'自定义模型'字段中明确指定模型名称")
+        elif model not in valid_models:
             print(f"[APIImageEdit] 警告: 模型 '{model}' 不属于 {api_provider} 提供商")
             print(f"[APIImageEdit] {api_provider} 可用模型: {', '.join(valid_models)}")
             print(f"[APIImageEdit] 请在界面中选择正确的模型")
             default_image = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
-            return (default_image, "API密钥未提供")
+            return (default_image, "请选择正确的模型")
         
         # 检查模型是否支持图像生成（聊天模式需要）
         supports_image_gen = self.is_image_generation_model(api_provider, model)
@@ -1260,8 +1427,34 @@ class APIImageEditNode:
         # 处理多个可选图像输入
         images = [img for img in [image1, image2, image3, image4] if img is not None]
         
-        # 处理备用API地址
-        if backup_api_url.strip():
+
+        # 处理自定义提供商和备用API地址
+        original_config = None
+        if api_provider == "Custom":
+            if not backup_api_url.strip():
+                print("[APIImageEdit] 错误: 自定义提供商需要提供API地址")
+                default_image = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
+                return (default_image, "自定义提供商需要提供API地址")
+            
+            # 设置自定义提供商的配置
+            original_config = self.api_configs.get("Custom", {}).copy()
+            self.api_configs["Custom"]["base_url"] = backup_api_url.strip()
+            
+            # 处理自定义模型
+            if custom_model.strip():
+                model = custom_model.strip()
+                print(f"[APIImageEdit] 使用自定义模型: {model}")
+            else:
+                # 如果没有提供自定义模型，使用默认模型
+                if model in ["custom-model-1", "custom-model-2", "custom-model-3"]:
+                    model = "gpt-4o"  # 默认模型
+                    print(f"[APIImageEdit] 使用默认模型: {model}")
+                
+            print(f"[APIImageEdit] 自定义提供商配置:")
+            print(f"[APIImageEdit]   API地址: {backup_api_url}")
+            print(f"[APIImageEdit]   模型: {model}")
+            
+        elif backup_api_url.strip():
             print(f"[APIImageEdit] 使用备用API地址: {backup_api_url}")
             # 临时修改API配置
             original_config = self.api_configs.get(api_provider, {}).copy()
@@ -1276,7 +1469,7 @@ class APIImageEditNode:
             result = self._handle_multiple_generation(api_provider, api_key, model, prompt, image_count, images, actual_seed)
             
             # 恢复原始API配置
-            if backup_api_url.strip() and 'original_config' in locals():
+            if original_config:
                 self.api_configs[api_provider] = original_config
                 print(f"[APIImageEdit] 已恢复原始API配置")
             
@@ -1288,7 +1481,7 @@ class APIImageEditNode:
             result = self._handle_chat_mode(api_provider, api_key, model, prompt, chat_history, images, reset_chat, actual_seed)
             
             # 恢复原始API配置
-            if backup_api_url.strip() and 'original_config' in locals():
+            if original_config:
                 self.api_configs[api_provider] = original_config
                 print(f"[APIImageEdit] 已恢复原始API配置")
             
@@ -1300,7 +1493,7 @@ class APIImageEditNode:
             result = self._handle_edit_history_mode(api_provider, api_key, model, prompt, edit_history, images, actual_seed)
             
             # 恢复原始API配置
-            if backup_api_url.strip() and 'original_config' in locals():
+            if original_config:
                 self.api_configs[api_provider] = original_config
                 print(f"[APIImageEdit] 已恢复原始API配置")
             
@@ -1449,7 +1642,7 @@ class APIImageEditNode:
                     print("[APIImageEdit] 图像编辑完成，成功返回结果")
                     
                     # 恢复原始API配置
-                    if backup_api_url.strip() and 'original_config' in locals():
+                    if original_config:
                         self.api_configs[api_provider] = original_config
                         print(f"[APIImageEdit] 已恢复原始API配置")
                     
@@ -1463,7 +1656,7 @@ class APIImageEditNode:
         
         # 如果API调用失败，根据模式返回适当的图像
         # 恢复原始API配置（在错误情况下）
-        if backup_api_url.strip() and 'original_config' in locals():
+        if original_config:
             self.api_configs[api_provider] = original_config
             print(f"[APIImageEdit] 已恢复原始API配置")
         
