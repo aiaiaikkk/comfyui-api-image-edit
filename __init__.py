@@ -4,7 +4,7 @@ ComfyUI API Image Edit - Custom Node Package
 一个支持多种API提供商的图片编辑自定义节点包
 支持阿里云千问和OpenRouter API
 
-Version: 1.0.0
+Version: 1.0.5
 Author: User
 """
 
@@ -12,7 +12,7 @@ import os
 import importlib.util
 import traceback
 
-__version__ = "1.0.1"  # Fixed UnboundLocalError in single mode
+__version__ = "1.0.5"  # Fixed Unicode encoding issues and improved error handling
 __author__ = "User"
 __description__ = "ComfyUI Custom Nodes for API-based Image Editing"
 
